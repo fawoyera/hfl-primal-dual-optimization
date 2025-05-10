@@ -1,514 +1,361 @@
 import numpy as np
-import matplotlib.pyplot as plt
-import time
-from sklearn.datasets import fetch_openml
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import log_loss, accuracy_score
-from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torchvision
-import torchvision.transforms as transforms
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Subset
+import random
+import matplotlib.pyplot as plt
 
-# 1. Configuration
-class Config:
-    n_clients = 100  # Total number of clients
-    n_edges = 10     # Number of edge servers
-    clients_per_edge = n_clients // n_edges
-    n_rounds = 100    # Total communication rounds
-    local_epochs = 5 # Local epochs per round
-    lr = 0.01        # Learning rate
-    reg = 0.01       # L2 regularization parameter
-    # Communication and time constraints
-    comm_limit = 10 ** 4.5  # Maximum bits per round
-    time_limit = 0.9  # Maximum time per round (seconds)
-    # Dual step sizes
-    eta_lambda = 0.01
-    eta_mu = 0.01
+# ====== Configurations ======
+DATASETS = ['MNIST', 'FMNIST', 'CIFAR10']
+NUM_CLIENTS = 30
+NUM_EDGES = 3
+CLIENTS_PER_EDGE = NUM_CLIENTS // NUM_EDGES
+ROUNDS = 20
+LOCAL_EPOCHS = 2
+BATCH_SIZE = 64
+LR = 0.05
+TAU = 2  # local aggregation frequency
+MODEL_BITS = 32  # bits per parameter
+B_CLIENT_EDGE = 2e6  # 2 Mbps
+B_EDGE_CLOUD = 5e6   # 5 Mbps
+C_TOTAL_MAX = 1e6    # total communication budget (bits)
+T_MAX = 50          # total time budget (seconds)
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
 
-# 2. Load and preprocess data
-def load_dataset(dataset_name, binary_class=0):
-    if dataset_name == 'mnist':
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,))
-        ])
-        train_dataset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-        test_dataset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
-    elif dataset_name == 'fashion':
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.2860,), (0.3530,))
-        ])
-        train_dataset = torchvision.datasets.FashionMNIST(root='./data', train=True, download=True, transform=transform)
-        test_dataset = torchvision.datasets.FashionMNIST(root='./data', train=False, download=True, transform=transform)
-    elif dataset_name == 'cifar10':
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
-        ])
-        train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-        test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
-    
-    # Create binary classification (one vs rest)
-    binary_train_dataset = [(x, 1 if y == binary_class else 0) for x, y in train_dataset]
-    binary_test_dataset = [(x, 1 if y == binary_class else 0) for x, y in test_dataset]
-    
-    return binary_train_dataset, binary_test_dataset
-
-# 3. Distribute data among clients
-def distribute_data(train_dataset, n_clients):
-    data_per_client = len(train_dataset) // n_clients
-    client_data = []
-    
-    for i in range(n_clients):
-        start_idx = i * data_per_client
-        end_idx = start_idx + data_per_client
-        client_data.append(train_dataset[start_idx:end_idx])
-    
-    return client_data
-
-# 4. Logistic Regression Model
+# ====== Model: Logistic Regression (Convex) ======
 class LogisticRegression(nn.Module):
-    def __init__(self, input_dim):
-        super(LogisticRegression, self).__init__()
-        self.linear = nn.Linear(input_dim, 1)
-    
+    def __init__(self, input_dim, num_classes):
+        super().__init__()
+        self.linear = nn.Linear(input_dim, num_classes)
     def forward(self, x):
-        return torch.sigmoid(self.linear(x.view(x.size(0), -1)))
+        x = x.view(x.size(0), -1)
+        return self.linear(x)
 
-# 5. Compute communication cost
-def compute_comm_cost(model):
-    # Count number of parameters in model
-    num_params = sum(p.numel() for p in model.parameters())
-    # Assume 32 bits (4 bytes) per parameter
-    return num_params * 4 * 8  # in bits
+def get_model(dataset):
+    if dataset in ['MNIST', 'FMNIST']:
+        input_dim = 28 * 28
+        num_classes = 10
+    elif dataset == 'CIFAR10':
+        input_dim = 32 * 32 * 3
+        num_classes = 10
+    else:
+        raise ValueError("Unknown dataset")
+    return LogisticRegression(input_dim, num_classes)
 
-# 6. Compute round time (simulated)
-def compute_round_time(model, n_clients, n_edges):
-    # Simple simulation of computation + communication time
-    # Depends on model size and network topology
-    model_size = sum(p.numel() for p in model.parameters())
-    comp_time = 0.01 * model_size / 1000  # Computation time
-    comm_time = 0.005 * model_size / 1000 * (n_clients/n_edges + n_edges)  # Communication time
-    return comp_time + comm_time
+# ====== Data Loading and Partitioning ======
+def load_data(dataset):
+    if dataset == 'MNIST':
+        ds = datasets.MNIST
+        tfm = transforms.Compose([transforms.ToTensor()])
+    elif dataset == 'FMNIST':
+        ds = datasets.FashionMNIST
+        tfm = transforms.Compose([transforms.ToTensor()])
+    elif dataset == 'CIFAR10':
+        ds = datasets.CIFAR10
+        tfm = transforms.Compose([transforms.ToTensor()])
+    else:
+        raise ValueError("Unknown dataset")
+    train = ds('./data', train=True, download=True, transform=tfm)
+    test = ds('./data', train=False, download=True, transform=tfm)
+    return train, test
 
-# 7. Main HFL algorithm with Primal-Dual updates
-def train_hfl(config, train_data, test_data, input_dim):
-    # Initialize model
-    global_model = LogisticRegression(input_dim)
-    
-    # Distribute data to clients
-    client_data = distribute_data(train_data, config.n_clients)
-    
-    # Edge server assignment
-    edge_clients = [list(range(i*config.clients_per_edge, (i+1)*config.clients_per_edge)) 
-                   for i in range(config.n_edges)]
-    
-    # Initialize dual variables
-    lambda_comm = 0.0
-    mu_time = 0.0
-    
-    # Tracking metrics
-    train_losses = []
-    test_losses = []
-    test_accs = []
-    comm_costs = []
-    round_times = []
-    dual_values = []
-    
-    # Convert test data to tensors
-    test_inputs = torch.stack([x for x, _ in test_data])
-    test_labels = torch.tensor([y for _, y in test_data]).float().unsqueeze(1)
-    
-    for round_idx in range(config.n_rounds):
-        round_start_time = time.time()
-        
-        # 1. Client Updates
+def partition_data(dataset, num_clients):
+    train, test = load_data(dataset)
+    data_per_client = len(train) // num_clients
+    indices = np.random.permutation(len(train))
+    client_indices = [indices[i*data_per_client:(i+1)*data_per_client] for i in range(num_clients)]
+    return [Subset(train, idxs) for idxs in client_indices], test
+
+# ====== Communication and Time Functions ======
+def model_size_bits(model):
+    return sum(p.numel() for p in model.parameters()) * MODEL_BITS
+
+def comm_cost_per_round(M, K, S, tau):
+    return (M * S) // tau + K * S
+
+def round_time(tau, B, C_i, M, K, S, B_client_edge, B_edge_cloud):
+    T_comp = max([(tau * B) / ci for ci in C_i])
+    T_comm = (M * S) / B_client_edge + (K * S) / B_EDGE_CLOUD
+    return T_comp + T_comm
+
+# ====== Federated Training ======
+def client_update(model, dataloader, epochs, lr):
+    model.train()
+    optimizer = optim.SGD(model.parameters(), lr=lr)
+    loss_fn = nn.CrossEntropyLoss()
+    for _ in range(epochs):
+        for x, y in dataloader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            optimizer.zero_grad()
+            loss = loss_fn(model(x), y)
+            loss.backward()
+            optimizer.step()
+    return {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+def aggregate_models(models):
+    avg_state = {}
+    for k in models[0].keys():
+        avg_state[k] = sum([m[k] for m in models]) / len(models)
+    return avg_state
+
+def evaluate(model, test_loader):
+    model.eval()
+    correct, total, total_loss = 0, 0, 0
+    loss_fn = nn.CrossEntropyLoss()
+    with torch.no_grad():
+        for x, y in test_loader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            logits = model(x)
+            total_loss += loss_fn(logits, y).item() * y.size(0)
+            pred = logits.argmax(dim=1)
+            correct += (pred == y).sum().item()
+            total += y.size(0)
+    return correct / total, total_loss / total
+
+# ====== HFL Primal-Dual Algorithm ======
+def hfl_primal_dual_experiment(dataset):
+    client_datasets, test_data = partition_data(dataset, NUM_CLIENTS)
+    test_loader = DataLoader(test_data, batch_size=256)
+    global_model = get_model(dataset).to(DEVICE)
+    S = model_size_bits(global_model)
+    C_i = np.random.uniform(100, 300, NUM_CLIENTS)  # samples/sec
+
+    lambda_dual, mu_dual = 0.0, 0.0
+    eta_lambda, eta_mu = 1e-7, 1e-4
+
+    lambda_hist, mu_hist, acc_hist, comm_hist, time_hist, test_loss_hist, primal_norm_hist = [], [], [], [], [], [], []
+    total_comm, total_time = 0, 0
+
+    for rnd in range(ROUNDS):
+        edge_clients = [list(range(i*CLIENTS_PER_EDGE, (i+1)*CLIENTS_PER_EDGE)) for i in range(NUM_EDGES)]
         client_models = []
-        for client_idx in range(config.n_clients):
-            # Clone global model
-            client_model = LogisticRegression(input_dim)
-            client_model.load_state_dict(global_model.state_dict())
-            
-            # Get client data
-            client_inputs = torch.stack([x for x, _ in client_data[client_idx]])
-            client_labels = torch.tensor([y for _, y in client_data[client_idx]]).float().unsqueeze(1)
-            
-            # Train locally
-            optimizer = optim.SGD(client_model.parameters(), lr=config.lr, weight_decay=config.reg)
-            criterion = nn.BCELoss()
-            
-            for _ in range(config.local_epochs):
-                # Forward pass
-                outputs = client_model(client_inputs)
-                
-                # Compute loss with regularization
-                loss = criterion(outputs, client_labels)
-                
-                # Add primal-dual terms for constraints
-                comm_cost = compute_comm_cost(client_model)
-                round_time = compute_round_time(client_model, config.n_clients, config.n_edges)
-                
-                primal_dual_loss = loss + lambda_comm * (comm_cost - config.comm_limit) + \
-                                  mu_time * (config.n_rounds * round_time - config.time_limit)
-                
-                # Backward and optimize
-                optimizer.zero_grad()
-                primal_dual_loss.backward()
-                optimizer.step()
-            
-            client_models.append(client_model)
-        
-        # 2. Edge Aggregation
-        edge_models = []
-        for edge_idx in range(config.n_edges):
-            edge_clients_list = edge_clients[edge_idx]
-            edge_model = LogisticRegression(input_dim)
-            edge_model.load_state_dict(global_model.state_dict())  # Initialize
-            
-            # Aggregate client models within this edge
+        for edge in edge_clients:
+            edge_model = get_model(dataset).to(DEVICE)
+            edge_model.load_state_dict(global_model.state_dict())
+            local_models = []
+            for cid in edge:
+                loader = DataLoader(client_datasets[cid], batch_size=BATCH_SIZE, shuffle=True)
+                local_model = get_model(dataset).to(DEVICE)
+                local_model.load_state_dict(edge_model.state_dict())
+                local_state = client_update(local_model, loader, LOCAL_EPOCHS, LR)
+                local_models.append(local_state)
+            edge_state = aggregate_models(local_models)
+            edge_model.load_state_dict(edge_state)
+            client_models.append(edge_model.state_dict())
+        global_state = aggregate_models(client_models)
+        global_model.load_state_dict(global_state)
+
+        C_round = comm_cost_per_round(NUM_CLIENTS, NUM_EDGES, S, TAU)
+        T_round = round_time(TAU, BATCH_SIZE, C_i, NUM_CLIENTS, NUM_EDGES, S, B_CLIENT_EDGE, B_EDGE_CLOUD)
+        C_budget = C_TOTAL_MAX / ROUNDS
+        T_budget = T_MAX / ROUNDS
+
+        lambda_dual = max(0, lambda_dual + eta_lambda * (C_round - C_budget))
+        mu_dual = max(0, mu_dual + eta_mu * (T_round - T_budget))
+
+        lambda_hist.append(lambda_dual)
+        mu_hist.append(mu_dual)
+        comm_hist.append(C_round)
+        time_hist.append(T_round)
+        total_comm += C_round
+        total_time += T_round
+
+        acc, test_loss = evaluate(global_model, test_loader)
+        acc_hist.append(acc)
+        test_loss_hist.append(test_loss)
+        # Primal norm (for plotting)
+        with torch.no_grad():
+            w_vec = torch.cat([p.view(-1) for p in global_model.parameters()])
+            primal_norm_hist.append(w_vec.norm().item())
+
+        print(f"[HFL-{dataset}] Round {rnd+1}/{ROUNDS} | Acc: {acc:.4f} | Loss: {test_loss:.4f} | Lambda: {lambda_dual:.2e} | Mu: {mu_dual:.2e} | Comm: {C_round:.2e} | Time: {T_round:.2f}")
+
+    return {
+        'acc': acc_hist, 'loss': test_loss_hist, 'lambda': lambda_hist, 'mu': mu_hist,
+        'comm': comm_hist, 'time': time_hist, 'primal_norm': primal_norm_hist,
+        'model': global_model, 'test_loader': test_loader, 'lambda_star': lambda_dual, 'mu_star': mu_dual,
+        'C_budget': C_budget, 'T_budget': T_budget, 'S': S, 'C_i': C_i
+    }
+
+# ====== FedAvg Baseline ======
+def fedavg_experiment(dataset):
+    client_datasets, test_data = partition_data(dataset, NUM_CLIENTS)
+    test_loader = DataLoader(test_data, batch_size=256)
+    global_model = get_model(dataset).to(DEVICE)
+    S = model_size_bits(global_model)
+    C_i = np.random.uniform(100, 300, NUM_CLIENTS)  # samples/sec
+
+    acc_hist, comm_hist, time_hist, test_loss_hist, primal_norm_hist = [], [], [], [], []
+    total_comm, total_time = 0, 0
+
+    for rnd in range(ROUNDS):
+        local_states = []
+        for cid in range(NUM_CLIENTS):
+            loader = DataLoader(client_datasets[cid], batch_size=BATCH_SIZE, shuffle=True)
+            local_model = get_model(dataset).to(DEVICE)
+            local_model.load_state_dict(global_model.state_dict())
+            local_state = client_update(local_model, loader, LOCAL_EPOCHS, LR)
+            local_states.append(local_state)
+        avg_state = aggregate_models(local_states)
+        global_model.load_state_dict(avg_state)
+
+        # Communication cost: all clients to server, no hierarchy
+        C_round = NUM_CLIENTS * S
+        # Time: slowest client
+        T_comp = max([(TAU * BATCH_SIZE) / ci for ci in C_i])
+        T_comm = (NUM_CLIENTS * S) / B_CLIENT_EDGE
+        T_round = T_comp + T_comm
+
+        comm_hist.append(C_round)
+        time_hist.append(T_round)
+        total_comm += C_round
+        total_time += T_round
+
+        acc, test_loss = evaluate(global_model, test_loader)
+        acc_hist.append(acc)
+        test_loss_hist.append(test_loss)
+        with torch.no_grad():
+            w_vec = torch.cat([p.view(-1) for p in global_model.parameters()])
+            primal_norm_hist.append(w_vec.norm().item())
+
+        print(f"[FedAvg-{dataset}] Round {rnd+1}/{ROUNDS} | Acc: {acc:.4f} | Loss: {test_loss:.4f} | Comm: {C_round:.2e} | Time: {T_round:.2f}")
+
+    return {
+        'acc': acc_hist, 'loss': test_loss_hist, 'comm': comm_hist, 'time': time_hist, 'primal_norm': primal_norm_hist,
+        'model': global_model, 'test_loader': test_loader
+    }
+
+# ====== Convexity and Strong Duality Plots ======
+def plot_primal_convexity(global_model, test_loader, dataset):
+    w0 = torch.cat([p.detach().flatten() for p in global_model.parameters()])
+    direction = torch.randn_like(w0)
+    direction = direction / torch.norm(direction)
+    t_vals = np.linspace(-2.5, 3.5, 41)
+    primal_vals = []
+    for t in t_vals:
+        offset = (w0 + t*direction).clone()
+        idx = 0
+        new_state = {}
+        for name, param in global_model.named_parameters():
+            numel = param.numel()
+            new_state[name] = offset[idx:idx+numel].reshape(param.shape)
+            idx += numel
+        test_model = get_model(dataset).to(DEVICE)
+        test_model.load_state_dict(new_state)
+        test_model.eval()
+        loss_fn = nn.CrossEntropyLoss()
+        total_loss, total = 0, 0
+        with torch.no_grad():
+            for x, y in test_loader:
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                logits = test_model(x)
+                total_loss += loss_fn(logits, y).item() * y.size(0)
+                total += y.size(0)
+        Fw = total_loss / total
+        primal_vals.append(Fw)
+    plt.figure()
+    plt.plot(t_vals, primal_vals, label='Primal Objective $F(w)$')
+    plt.xlabel('Line search parameter $t$')
+    plt.ylabel('Objective value')
+    plt.title('Convexity of Primal Objective')
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+def plot_dual_convexity(global_model, dataset, S, C_i, test_loader):
+    # Define grid for lambda and mu
+    lambda_vals = np.linspace(0, 2e-5, 21)
+    mu_vals = np.linspace(0, 2e-2, 21)
+    dual_grid = np.zeros((len(lambda_vals), len(mu_vals)))
+
+    # Evaluate dual function at each (lambda, mu) pair
+    for i, lmbd in enumerate(lambda_vals):
+        for j, mu in enumerate(mu_vals):
+            # For each (lambda, mu), evaluate L(w, lambda, mu) at current w (approximation)
+            model = get_model(dataset).to(DEVICE)
+            model.load_state_dict(global_model.state_dict())
+            loss_fn = torch.nn.CrossEntropyLoss()
+            total_loss, total = 0, 0
             with torch.no_grad():
-                for name, param in edge_model.named_parameters():
-                    # Average the parameters
-                    param.data = torch.mean(torch.stack([client_models[c].state_dict()[name].data 
-                                                        for c in edge_clients_list]), dim=0)
-            
-            edge_models.append(edge_model)
-        
-        # 3. Central Aggregation
-        with torch.no_grad():
-            for name, param in global_model.named_parameters():
-                # Average the parameters from all edge models
-                param.data = torch.mean(torch.stack([em.state_dict()[name].data for em in edge_models]), dim=0)
-        
-        # 4. Evaluate current model
-        global_model.eval()
-        with torch.no_grad():
-            test_outputs = global_model(test_inputs)
-            test_loss = nn.BCELoss()(test_outputs, test_labels)
-            test_preds = (test_outputs > 0.5).float()
-            test_acc = (test_preds == test_labels).float().mean()
-        
-        # 5. Dual Updates
-        comm_cost = compute_comm_cost(global_model)
-        round_time = compute_round_time(global_model, config.n_clients, config.n_edges)
-        
-        # Update dual variables
-        lambda_comm = max(0.0, lambda_comm + config.eta_lambda * (comm_cost - config.comm_limit))
-        mu_time = max(0.0, mu_time + config.eta_mu * (config.n_rounds * round_time - config.time_limit))
-        
-        # 6. Record metrics
-        train_losses.append(loss.item())
-        test_losses.append(test_loss.item())
-        test_accs.append(test_acc.item())
-        comm_costs.append(comm_cost)
-        round_times.append(round_time)
-        dual_values.append((lambda_comm, mu_time))
-        
-        actual_round_time = time.time() - round_start_time
-        
-        if round_idx % 5 == 0:
-            print(f"Round {round_idx}: Test Loss: {test_loss.item():.4f}, Test Acc: {test_acc.item():.4f}, "
-                  f"Comm Cost: {comm_cost/1000:.2f} Kb, Round Time: {actual_round_time:.2f}s, "
-                  f"λ: {lambda_comm:.4f}, μ: {mu_time:.4f}")
-    
-    return {
-        'train_losses': train_losses,
-        'test_losses': test_losses,
-        'test_accs': test_accs,
-        'comm_costs': comm_costs,
-        'round_times': round_times,
-        'dual_values': dual_values,
-        'final_model': global_model
-    }
+                for x, y in test_loader:
+                    x, y = x.to(DEVICE), y.to(DEVICE)
+                    logits = model(x)
+                    total_loss += loss_fn(logits, y).item() * y.size(0)
+                    total += y.size(0)
+            Fw = total_loss / total
+            # Constraints (simulate as constants for visualization)
+            C_round = comm_cost_per_round(NUM_CLIENTS, NUM_EDGES, S, TAU)
+            T_round = round_time(TAU, BATCH_SIZE, C_i, NUM_CLIENTS, NUM_EDGES, S, B_CLIENT_EDGE, B_EDGE_CLOUD)
+            dual_grid[i, j] = Fw + lmbd * (C_round) + mu * (T_round)
 
-# 8. Standard FedAvg for comparison
-def train_fedavg(config, train_data, test_data, input_dim):
-    # Similar to HFL but with direct client-to-central aggregation
-    global_model = LogisticRegression(input_dim)
-    client_data = distribute_data(train_data, config.n_clients)
-    
-    # Tracking metrics
-    test_losses = []
-    test_accs = []
-    comm_costs = []
-    round_times = []
-    
-    # Convert test data to tensors
-    test_inputs = torch.stack([x for x, _ in test_data])
-    test_labels = torch.tensor([y for _, y in test_data]).float().unsqueeze(1)
-    
-    for round_idx in range(config.n_rounds):
-        round_start_time = time.time()
-        
-        # 1. Client Updates
-        client_models = []
-        for client_idx in range(config.n_clients):
-            # Clone global model
-            client_model = LogisticRegression(input_dim)
-            client_model.load_state_dict(global_model.state_dict())
-            
-            # Get client data
-            client_inputs = torch.stack([x for x, _ in client_data[client_idx]])
-            client_labels = torch.tensor([y for _, y in client_data[client_idx]]).float().unsqueeze(1)
-            
-            # Train locally
-            optimizer = optim.SGD(client_model.parameters(), lr=config.lr, weight_decay=config.reg)
-            criterion = nn.BCELoss()
-            
-            for _ in range(config.local_epochs):
-                # Forward pass
-                outputs = client_model(client_inputs)
-                loss = criterion(outputs, client_labels)
-                
-                # Backward and optimize
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-            
-            client_models.append(client_model)
-        
-        # 2. Central Aggregation (no edge servers)
-        with torch.no_grad():
-            for name, param in global_model.named_parameters():
-                # Average the parameters from all client models
-                param.data = torch.mean(torch.stack([cm.state_dict()[name].data for cm in client_models]), dim=0)
-        
-        # 3. Evaluate current model
-        global_model.eval()
-        with torch.no_grad():
-            test_outputs = global_model(test_inputs)
-            test_loss = nn.BCELoss()(test_outputs, test_labels)
-            test_preds = (test_outputs > 0.5).float()
-            test_acc = (test_preds == test_labels).float().mean()
-        
-        # 4. Record metrics
-        comm_cost = config.n_clients * compute_comm_cost(global_model)  # Direct client-to-central communication
-        round_time = time.time() - round_start_time
-        
-        test_losses.append(test_loss.item())
-        test_accs.append(test_acc.item())
-        comm_costs.append(comm_cost)
-        round_times.append(round_time)
-        
-        if round_idx % 5 == 0:
-            print(f"FedAvg Round {round_idx}: Test Loss: {test_loss.item():.4f}, "
-                  f"Test Acc: {test_acc.item():.4f}, Comm Cost: {comm_cost/1000:.2f} Kb")
-    
-    return {
-        'test_losses': test_losses,
-        'test_accs': test_accs,
-        'comm_costs': comm_costs,
-        'round_times': round_times,
-        'final_model': global_model
-    }
-
-# 9. Plot Convexity of Primal Problem
-def plot_primal_convexity(model, test_data, reg=0.01):
-    # Generate points around the optimal model parameters
-    weights = next(model.parameters()).data.flatten()[0].item()
-    w_range = np.linspace(weights - 2.0, weights + 2.0, 100)
-    
-    # Get test data
-    test_inputs = torch.stack([x for x, _ in test_data[:1000]])  # Use subset for efficiency
-    test_labels = torch.tensor([y for _, y in test_data[:1000]]).float().unsqueeze(1)
-    
-    # Compute loss for different weight values
-    losses = []
-    for w in w_range:
-        temp_model = LogisticRegression(test_inputs.shape[1])
-        # Set all weights to w
-        with torch.no_grad():
-            # Reshape the weights to match the expected shape
-            reshaped_weights = torch.tensor(w * np.ones((1, test_inputs.shape[1] * test_inputs.shape[2] * test_inputs.shape[3])), dtype=torch.float32)
-            temp_model.linear.weight.data = reshaped_weights
-            temp_model.linear.bias.data.fill_(0.0)  # Reset bias
-            #temp_model.linear.weight.data = torch.tensor(w * np.ones((1, test_inputs.shape[1])), dtype=torch.float32)
-            #temp_model.linear.bias.data.fill_(0.0)  # Reset bias
-            # param in temp_model.parameters():
-                #param.data = torch.ones_like(param.data) * w  # Keep the original shape
-                #param.data = torch.tensor(w * np.ones(param.shape), dtype=torch.float32)  # Initialize with the correct shape
-                #param.fill_(w)
-        
-        # Compute loss
-        outputs = temp_model(test_inputs)
-        loss = nn.BCELoss()(outputs, test_labels) + reg * w**2
-        losses.append(loss.item())
-    
-    # Plot
-    plt.figure(figsize=(10, 6))
-    plt.plot(w_range, losses)
-    plt.scatter([weights], [losses[np.argmin(np.abs(w_range - weights))]], color='red', s=100, marker='*')
-    plt.title('Convexity of Primal Problem (Loss vs Weight)')
-    plt.xlabel('Weight Value')
-    plt.ylabel('Loss')
-    plt.grid(True)
-    plt.show()
-
-# 10. Plot Convexity of Dual Problem
-def plot_dual_convexity(lambda_values, mu_values, dual_function):
-    # Create meshgrid for 3D surface plot
-    lambda_range = np.linspace(0, max(lambda_values)*1.5, 50)
-    mu_range = np.linspace(0, max(mu_values)*1.5, 50)
-    Lambda, Mu = np.meshgrid(lambda_range, mu_range)
-    
-    # Compute dual function values
-    Z = np.zeros_like(Lambda)
-    for i in range(len(lambda_range)):
-        for j in range(len(mu_range)):
-            Z[j, i] = dual_function(lambda_range[i], mu_range[j])
-    
-    # Plot 3D surface
-    fig = plt.figure(figsize=(12, 10))
+    # 3D surface plot
+    Lambda, Mu = np.meshgrid(mu_vals, lambda_vals)
+    fig = plt.figure(figsize=(8,6))
     ax = fig.add_subplot(111, projection='3d')
-    surf = ax.plot_surface(Lambda, Mu, Z, cmap='viridis', alpha=0.8)
-    
-    # Mark the maximum point (remember dual is maximized)
-    max_idx = np.unravel_index(np.argmax(Z), Z.shape)
-    max_lambda, max_mu = lambda_range[max_idx[1]], mu_range[max_idx[0]]
-    max_val = Z[max_idx]
-    ax.scatter([max_lambda], [max_mu], [max_val], color='red', s=100, marker='*')
-    
-    # Mark the actual dual variables
-    for i, (l, m) in enumerate(zip(lambda_values, mu_values)):
-        if i % 5 == 0:  # Plot every 5th point to avoid clutter
-            dual_val = dual_function(l, m)
-            ax.scatter([l], [m], [dual_val], color='blue', s=50)
-    
-    # Add colorbar and labels
+    surf = ax.plot_surface(Lambda, Mu, dual_grid, cmap='viridis', edgecolor='none')
+    ax.set_xlabel(r'$\mu$')
+    ax.set_ylabel(r'$\lambda$')
+    ax.set_zlabel(r'$g(\lambda, \mu)$')
+    ax.set_title('Convexity of Dual Function $g(\lambda, \mu)$')
     fig.colorbar(surf, shrink=0.5, aspect=5)
-    ax.set_xlabel('λ (Communication)')
-    ax.set_ylabel('μ (Time)')
-    ax.set_zlabel('Dual Function Value')
-    ax.set_title('Convexity of Dual Problem')
     plt.show()
 
 
-# Function to plot the evolution of dual variables
-def plot_dual_evolution(lambda_hist, mu_hist):
-    plt.figure(figsize=(10, 4))
-    
-    plt.subplot(1, 2, 1)
-    plt.plot(lambda_hist, 'b-', linewidth=2)
-    plt.xlabel('Iteration', fontsize=12)
-    plt.ylabel('Lambda (λ)', fontsize=12)
-    plt.title('Communication Constraint Dual Variable')
-    plt.grid(True)
+# ====== Main Experiment Loop ======
+for ds in DATASETS:
+    print("\n" + "="*40)
+    print(f"Running experiments for {ds}")
+    print("="*40)
+    hfl_res = hfl_primal_dual_experiment(ds)
+    fedavg_res = fedavg_experiment(ds)
 
-    plt.subplot(1, 2, 2)
-    plt.plot(mu_hist, 'r-', linewidth=2)
-    plt.xlabel('Iteration', fontsize=12)
-    plt.ylabel('Mu (μ)', fontsize=12)
-    plt.title('Time Constraint Dual Variable')
-    plt.grid(True)
+    # 1. Convexity of Primal and Dual
+    plot_primal_convexity(hfl_res['model'], hfl_res['test_loader'], ds)
+    plot_dual_convexity(hfl_res['model'], ds, hfl_res['S'], hfl_res['C_i'], hfl_res['test_loader'])
 
-    plt.tight_layout()
-    plt.show()  # Display the plot
+    # 2. Test loss, accuracy, C_round, T_round vs rounds (HFL vs FedAvg)
+    plt.figure(figsize=(10,6))
+    plt.subplot(2,2,1)
+    plt.plot(hfl_res['loss'], label='HFL')
+    plt.plot(fedavg_res['loss'], label='FedAvg', linestyle='--')
+    plt.title('Test Loss'); plt.xlabel('Round')
+    plt.legend(); plt.grid()
+    plt.subplot(2,2,2)
+    plt.plot(hfl_res['acc'], label='HFL')
+    plt.plot(fedavg_res['acc'], label='FedAvg', linestyle='--')
+    plt.title('Test Accuracy'); plt.xlabel('Round')
+    plt.legend(); plt.grid()
+    plt.subplot(2,2,3)
+    plt.plot(hfl_res['comm'], label='HFL')
+    plt.plot(fedavg_res['comm'], label='FedAvg', linestyle='--')
+    plt.title('C_round'); plt.xlabel('Round')
+    plt.legend(); plt.grid()
+    plt.subplot(2,2,4)
+    plt.plot(hfl_res['time'], label='HFL')
+    plt.plot(fedavg_res['time'], label='FedAvg', linestyle='--')
+    plt.title('T_round'); plt.xlabel('Round')
+    plt.legend(); plt.grid()
+    plt.tight_layout(); plt.show()
 
+    # 3. Evolution of primal and dual variables (HFL)
+    plt.figure()
+    plt.plot(hfl_res['primal_norm'], label='||w|| (primal)')
+    plt.plot(hfl_res['lambda'], label='Lambda (dual)')
+    plt.plot(hfl_res['mu'], label='Mu (dual)')
+    plt.xlabel('Round'); plt.title('Evolution of Primal/Dual Variables (HFL)')
+    plt.legend(); plt.grid(); plt.show()
 
-# 11. Main execution function
-def run_experiments():
-    config = Config()
-    results = {}
-    
-    for dataset_name in ['mnist', 'fashion', 'cifar10']:
-        print(f"\n\n--- Running experiments on {dataset_name.upper()} ---")
-        
-        # Load data
-        train_data, test_data = load_dataset(dataset_name)
-        
-        # Get input dimensions
-        if dataset_name == 'mnist' or dataset_name == 'fashion':
-            input_dim = 28 * 28
-        else:  # cifar10
-            input_dim = 32 * 32 * 3
-        
-        # Train HFL
-        print("Training HFL with Primal-Dual updates...")
-        hfl_results = train_hfl(config, train_data, test_data, input_dim)
-        
-        # Train FedAvg
-        print("Training FedAvg for comparison...")
-        fedavg_results = train_fedavg(config, train_data, test_data, input_dim)
-        
-        # Store results
-        results[dataset_name] = {
-            'hfl': hfl_results,
-            'fedavg': fedavg_results
-        }
-        
-        # Plot convexity of primal problem
-        plot_primal_convexity(hfl_results['final_model'], test_data)
-        
-        # Simulate dual function for plotting
-        def dual_function(lambda_val, mu_val):
-            # This is a simplified representation of the dual function
-            # In reality, you would need to solve the inner minimization problem
-            return -1.0 * (lambda_val**2 + mu_val**2) + lambda_val * config.comm_limit + mu_val * config.time_limit
-        
-        # Plot convexity of dual problem
-        lambda_values = [d[0] for d in hfl_results['dual_values']]
-        mu_values = [d[1] for d in hfl_results['dual_values']]
-        plot_dual_convexity(lambda_values, mu_values, dual_function)
-    
-        # Plot dual variable evolution for HFL
-        lambda_hist = [d[0] for d in hfl_results['dual_values']]
-        mu_hist = [d[1] for d in hfl_results['dual_values']]
-        plot_dual_evolution(lambda_hist, mu_hist)
-
-    # Create comparison plots
-    for dataset_name in results:
-        hfl = results[dataset_name]['hfl']
-        fedavg = results[dataset_name]['fedavg']
-        
-        # Plot test accuracy
-        plt.figure(figsize=(12, 8))
-        plt.subplot(2, 2, 1)
-        plt.plot(range(1, config.n_rounds + 1), hfl['test_accs'], label='HFL')
-        plt.plot(range(1, config.n_rounds + 1), fedavg['test_accs'], label='FedAvg')
-        plt.xlabel('Rounds')
-        plt.ylabel('Test Accuracy')
-        plt.title(f'{dataset_name.upper()}: Test Accuracy')
-        plt.legend()
-        plt.grid(True)
-        
-        # Plot test loss
-        plt.subplot(2, 2, 2)
-        plt.plot(range(1, config.n_rounds + 1), hfl['test_losses'], label='HFL')
-        plt.plot(range(1, config.n_rounds + 1), fedavg['test_losses'], label='FedAvg')
-        plt.xlabel('Rounds')
-        plt.ylabel('Test Loss')
-        plt.title(f'{dataset_name.upper()}: Test Loss')
-        plt.legend()
-        plt.grid(True)
-        
-        # Plot communication cost
-        plt.subplot(2, 2, 3)
-        plt.plot(range(1, config.n_rounds + 1), hfl['comm_costs'], label='HFL')
-        plt.plot(range(1, config.n_rounds + 1), fedavg['comm_costs'], label='FedAvg')
-        plt.xlabel('Rounds')
-        plt.ylabel('Communication Cost (bits)')
-        plt.title(f'{dataset_name.upper()}: Communication Cost')
-        plt.legend()
-        plt.grid(True)
-        
-        # Plot round time
-        plt.subplot(2, 2, 4)
-        plt.plot(range(1, config.n_rounds + 1), hfl['round_times'], label='HFL')
-        plt.plot(range(1, config.n_rounds + 1), fedavg['round_times'], label='FedAvg')
-        plt.xlabel('Rounds')
-        plt.ylabel('Round Time (seconds)')
-        plt.title(f'{dataset_name.upper()}: Round Time')
-        plt.legend()
-        plt.grid(True)
-        
-        plt.tight_layout()
-        plt.show()
-    
-    return results
-
-# Run the experiments
-if __name__ == "__main__":
-    results = run_experiments()
+    # 4. Final comparison summary
+    print(f"\n[Summary: {ds}]")
+    print(f"  HFL Final Accuracy:   {hfl_res['acc'][-1]:.4f}")
+    print(f"  FedAvg Final Accuracy:{fedavg_res['acc'][-1]:.4f}")
+    print(f"  HFL Total Comm:       {sum(hfl_res['comm']):.2e} bits")
+    print(f"  FedAvg Total Comm:    {sum(fedavg_res['comm']):.2e} bits")
+    print(f"  HFL Total Time:       {sum(hfl_res['time']):.2f} sec")
+    print(f"  FedAvg Total Time:    {sum(fedavg_res['time']):.2f} sec")
